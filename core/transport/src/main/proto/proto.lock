@@ -1565,6 +1565,10 @@
               {
                 "name": "FREE",
                 "integer": 1
+              },
+              {
+                "name": "DELETE_ALLUXIO",
+                "integer": 2
               }
             ]
           },
@@ -8584,6 +8588,10 @@
               {
                 "name": "FREE",
                 "integer": 1
+              },
+              {
+                "name": "DELETE_ALLUXIO",
+                "integer": 2
               }
             ]
           },

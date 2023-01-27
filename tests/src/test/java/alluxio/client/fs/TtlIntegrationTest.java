@@ -11,14 +11,19 @@
 
 package alluxio.client.fs;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import alluxio.AlluxioURI;
+import alluxio.Constants;
+import alluxio.client.file.FileOutStream;
 import alluxio.client.file.FileSystem;
 import alluxio.conf.PropertyKey;
 import alluxio.grpc.CreateFilePOptions;
 import alluxio.grpc.FileSystemMasterCommonPOptions;
+import alluxio.grpc.LoadMetadataPType;
+import alluxio.grpc.TtlAction;
 import alluxio.grpc.WritePType;
 import alluxio.heartbeat.HeartbeatContext;
 import alluxio.heartbeat.HeartbeatScheduler;
@@ -32,6 +37,8 @@ import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 
+import java.util.Arrays;
+
 /**
  * Integration tests for handling file TTLs (times to live).
  */
@@ -40,6 +47,10 @@ public class TtlIntegrationTest extends BaseIntegrationTest {
 
   private FileSystem mFileSystem;
 
+  private FileOutStream mOutStream = null;
+
+  protected byte[] mBuffer;
+
   @ClassRule
   public static ManuallyScheduleHeartbeat sManuallySchedule =
       new ManuallyScheduleHeartbeat(HeartbeatContext.MASTER_TTL_CHECK);
@@ -47,15 +58,92 @@ public class TtlIntegrationTest extends BaseIntegrationTest {
   @Rule
   public LocalAlluxioClusterResource mLocalAlluxioClusterResource =
       new LocalAlluxioClusterResource.Builder()
-          .setProperty(PropertyKey.MASTER_TTL_CHECKER_INTERVAL_MS, TTL_INTERVAL_MS).build();
+              .setProperty(PropertyKey.MASTER_TTL_CHECKER_INTERVAL_MS, TTL_INTERVAL_MS)
+              .setProperty(PropertyKey.USER_FILE_METADATA_LOAD_TYPE, LoadMetadataPType.NEVER)
+              .build();
 
   @Before
   public void before() {
     mFileSystem = FileSystem.Factory.create();
+    mBuffer = new byte[10];
+    Arrays.fill(mBuffer, (byte) 'A');
   }
 
   /**
-   * Tests that when many TTLs expire at the same time, files are deleted properly.
+   * Tests that when many TTLs expire at the same time, files are deleted from alluxio properly.
+   */
+  @Test
+  public void expireManyAfterDeleteAlluxio() throws Exception {
+    int numFiles = 100;
+    AlluxioURI[] files = new AlluxioURI[numFiles];
+    for (int i = 0; i < numFiles; i++) {
+      files[i] = new AlluxioURI("/file" + i);
+      // Only the even-index files should expire.
+      long ttl = i % 2 == 0 ? TTL_INTERVAL_MS / 2 : TTL_INTERVAL_MS * 1000;
+      mOutStream = mFileSystem.createFile(files[i],
+          CreateFilePOptions.newBuilder().setWriteType(WritePType.CACHE_THROUGH)
+              .setCommonOptions(FileSystemMasterCommonPOptions.newBuilder().setTtl(ttl)).build());
+      mOutStream.write(mBuffer, 0, 10);
+      mOutStream.close();
+
+      // Delete some of the even files to make sure this doesn't trip up the TTL checker.
+      if (i % 20 == 0) {
+        mFileSystem.delete(files[i]);
+      }
+    }
+    CommonUtils.sleepMs(2 * TTL_INTERVAL_MS);
+    HeartbeatScheduler.execute(HeartbeatContext.MASTER_TTL_CHECK);
+    for (int i = 0; i < numFiles; i++) {
+      if (i % 2 == 0) {
+        assertFalse(mFileSystem.exists(files[i]));
+      } else {
+        assertTrue(mFileSystem.exists(files[i]));
+      }
+    }
+  }
+
+  /**
+   * Tests that when many TTLs expire at the same time, files are freed properly.
+   */
+  @Test
+  public void expireManyAfterFree() throws Exception {
+    int numFiles = 100;
+    AlluxioURI[] files = new AlluxioURI[numFiles];
+    for (int i = 0; i < numFiles; i++) {
+      files[i] = new AlluxioURI("/file" + i);
+      // Only the even-index files should expire.
+      long ttl = i % 2 == 0 ? TTL_INTERVAL_MS / 2 : TTL_INTERVAL_MS * 1000;
+      mOutStream = mFileSystem.createFile(files[i],
+              CreateFilePOptions.newBuilder().setWriteType(WritePType.CACHE_THROUGH)
+                      .setCommonOptions(FileSystemMasterCommonPOptions.newBuilder().setTtl(ttl)
+                              .setTtlAction(TtlAction.FREE)).build());
+      mOutStream.write(mBuffer, 0, 10);
+      mOutStream.close();
+
+      // Delete some of the even files to make sure this doesn't trip up the TTL checker.
+      if (i % 20 == 0) {
+        mFileSystem.delete(files[i]);
+      }
+    }
+    CommonUtils.sleepMs(2 * TTL_INTERVAL_MS);
+    HeartbeatScheduler.execute(HeartbeatContext.MASTER_TTL_CHECK);
+    for (int i = 0; i < numFiles; i++) {
+      if (i % 2 == 0) {
+        if (i % 20 != 0) {
+          assertEquals(Constants.NO_TTL, mFileSystem.getStatus(files[i]).getTtl());
+          assertEquals(TtlAction.DELETE, mFileSystem.getStatus(files[i]).getTtlAction());
+          assertEquals(0, mFileSystem.getStatus(files[i]).getInMemoryPercentage());
+        }
+      } else {
+        assertTrue(mFileSystem.exists(files[i]));
+        assertEquals(100, mFileSystem.getStatus(files[i]).getInMemoryPercentage());
+      }
+    }
+  }
+
+  /**
+   * Tests that when many TTLs expire at the same time, files are deleted from Alluxio and
+   * UFS properly.
    */
   @Test
   public void expireManyAfterDelete() throws Exception {
@@ -65,10 +153,13 @@ public class TtlIntegrationTest extends BaseIntegrationTest {
       files[i] = new AlluxioURI("/file" + i);
       // Only the even-index files should expire.
       long ttl = i % 2 == 0 ? TTL_INTERVAL_MS / 2 : TTL_INTERVAL_MS * 1000;
-      mFileSystem.createFile(files[i],
-          CreateFilePOptions.newBuilder().setWriteType(WritePType.THROUGH)
-              .setCommonOptions(FileSystemMasterCommonPOptions.newBuilder().setTtl(ttl)).build())
-          .close();
+      mOutStream = mFileSystem.createFile(files[i],
+              CreateFilePOptions.newBuilder().setWriteType(WritePType.CACHE_THROUGH)
+                      .setCommonOptions(FileSystemMasterCommonPOptions.newBuilder().setTtl(ttl)
+                              .setTtlAction(TtlAction.DELETE)).build());
+      mOutStream.write(mBuffer, 0, 10);
+      mOutStream.close();
+
       // Delete some of the even files to make sure this doesn't trip up the TTL checker.
       if (i % 20 == 0) {
         mFileSystem.delete(files[i]);
